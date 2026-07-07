@@ -21,18 +21,16 @@ local.properties
 keystore.properties
 /Keys/
 
-# Runtime PHP config with real DB credentials + admin password hash.
-# Deployed manually to a location outside public_html on the server.
-# Both possible locations:
-#   config_dc/config.php  — production (outside public_html)
-#   cloudserver/config.php — legacy dev fallback (co-located)
-# The template that IS safe to commit is cloudserver/config.example.php.
-/config_dc/
-/cloudserver/config.php
+# Runtime PHP config templates are committed with placeholder values.
+# When deploying, copy them and fill in real credentials — the copies
+# should live OUTSIDE the docroot and MUST NOT be committed.
+# Add any real-secret overrides here:
+#   /config_dc/config.local.php
+#   /cloudserver/config.local.php
 
-# Production database dumps — contain real device IDs, IPs, playlist data.
-# Keep out of source control; store backups separately.
-*.sql
+# Committed SQL is schema-only (no INSERTs). Any dumps that include data
+# should carry a .data.sql suffix and stay out of the repo.
+*.data.sql
 
 # Build outputs (Android + IDE cruft not covered above).
 /app/build/
