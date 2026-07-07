@@ -1,0 +1,14 @@
+/* Trim Bootstrap defaults to taste. The dashboard runs on desktop primarily;
+   the navbar collapses on mobile but most pages assume a wider screen. */
+body { background: #f6f7f9; }
+main { padding-bottom: 64px; }
+
+code { color: #444; background: rgba(0,0,0,0.04); padding: 1px 5px; border-radius: 3px; }
+.card { border: 1px solid #e5e7eb; }
+.card .card-body h2.h6 { color: #555; text-transform: uppercase; letter-spacing: 0.04em; font-size: 12px; }
+
+/* Sortable-friendly drag style for playlist editor. */
+#items-list .list-group-item { transition: background 120ms ease; }
+#items-list .list-group-item.sortable-ghost { opacity: 0.4; background: #fff7d6; }
+#items-list .list-group-item.sortable-chosen { background: #eef5ff; }
+#items-list .handle { font-size: 18px; line-height: 1; }

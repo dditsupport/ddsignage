@@ -1,0 +1,14 @@
+# /media/ holds image, video, and audio files. Allow public read but disable
+# listing so the catalog isn't crawlable.
+Options -Indexes
+
+<IfModule mod_headers.c>
+    # 1 day browser cache; cache busting is via ?v=<mtime> in playlist.
+    Header set Cache-Control "public, max-age=86400"
+</IfModule>
+
+# Block PHP execution under /media/ — even if someone uploads a .php file
+# (we filter on upload, but belt-and-braces).
+<FilesMatch "\.(php|phtml|phar)$">
+    Require all denied
+</FilesMatch>

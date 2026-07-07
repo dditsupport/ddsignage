@@ -1,0 +1,42 @@
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Release-signing secrets — keystore + passwords. The keystore.properties
+# file is read by app/build.gradle.kts; Keys/ holds the .jks file itself.
+# Lose either and OTA updates break across the entire fleet (signature
+# mismatch on next install), so back them up off-machine.
+keystore.properties
+/Keys/
+
+# Runtime PHP config with real DB credentials + admin password hash.
+# Deployed manually to a location outside public_html on the server.
+# Both possible locations:
+#   config_dc/config.php  — production (outside public_html)
+#   cloudserver/config.php — legacy dev fallback (co-located)
+# The template that IS safe to commit is cloudserver/config.example.php.
+/config_dc/
+/cloudserver/config.php
+
+# Production database dumps — contain real device IDs, IPs, playlist data.
+# Keep out of source control; store backups separately.
+*.sql
+
+# Build outputs (Android + IDE cruft not covered above).
+/app/build/
+*.apk
+*.aab
+*.jks
+*.keystore

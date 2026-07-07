@@ -1,0 +1,12 @@
+# /apk/ — public APK downloads. No listing; only .apk and .json (manifest)
+# are servable. PHP execution blocked.
+Options -Indexes
+
+<FilesMatch "\.apk$">
+    ForceType application/vnd.android.package-archive
+    Header set Content-Disposition "attachment"
+</FilesMatch>
+
+<FilesMatch "\.(php|phtml|phar)$">
+    Require all denied
+</FilesMatch>

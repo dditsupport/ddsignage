@@ -1,0 +1,1583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DangeeCast Player</title>
+<style>
+  /* Player runs fullscreen on a TV — no scrollbars, no margins, black bg. */
+  html, body { margin: 0; padding: 0; height: 100%; width: 100%; overflow: hidden;
+               background: #000; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  #stage { position: fixed; top: 0; right: 0; bottom: 0; left: 0; }
+  /* Two layers for crossfade between items. */
+  .layer { position: absolute; top: 0; right: 0; bottom: 0; left: 0; opacity: 0; transition: opacity 600ms ease;
+           display: flex; align-items: center; justify-content: center; background: #000; }
+  .layer.visible { opacity: 1; }
+  .layer img, .layer video { max-width: 100%; max-height: 100%; width: 100%; height: 100%; object-fit: contain; }
+
+  /* Status overlay — small, top-right, only shown briefly or while there's a problem.
+     Errors auto-bump font size + opacity so they're legible from across the room. */
+  #status { position: fixed; top: 12px; right: 12px; padding: 6px 10px; border-radius: 4px;
+            background: rgba(0,0,0,0.55); font-family: monospace; font-size: 11px;
+            opacity: 0.55; pointer-events: none; max-width: 70vw;
+            white-space: pre-wrap; word-break: break-all; z-index: 20; }
+  #status.error { background: rgba(180,40,40,0.95); opacity: 1; font-size: 18px; padding: 10px 14px; }
+  #status.warn  { background: rgba(180,140,40,0.85); opacity: 1; }
+  #status:empty { display: none; }
+
+  /* Full-screen text panels for special states. */
+  .panel { position: fixed; top: 0; right: 0; bottom: 0; left: 0; display: none; flex-direction: column;
+           align-items: center; justify-content: center; padding: 48px; text-align: center;
+           background: #000; color: #fff; z-index: 10; }
+  .panel.visible { display: flex; }
+  .panel h1 { margin: 0 0 24px 0; font-size: 36px; font-weight: 700; }
+  .panel p  { margin: 8px 0; font-size: 18px; color: #ccc; }
+  .panel .id { margin-top: 32px; padding: 16px 24px; border: 1px solid #444;
+               border-radius: 8px; background: #111; font-family: monospace;
+               font-size: 22px; line-height: 1.6; }
+  .panel small { display: block; margin-top: 24px; color: #888; font-size: 12px; }
+
+  /* Bottom progress bar — shows for image items. */
+  #progress { position: fixed; left: 0; right: 0; bottom: 0; height: 3px;
+              background: rgba(255,255,255,0.08); z-index: 5; }
+  #progress > span { display: block; height: 100%; width: 0; background: rgba(255,255,255,0.6);
+                     transition: width 100ms linear; }
+
+  /* Downloads panel — toggled by DOWN key (APK bridges KEYCODE_DPAD_DOWN to
+     window.signageToggleDownloads). Shows the folder path at the top and a
+     per-item load status table below, so a tech standing at the screen with
+     just the remote can diagnose "why is the image not showing". */
+  #downloads { position: fixed; top: 0; right: 0; bottom: 0; left: 0; background: rgba(0,0,0,0.92); color: #fff;
+               font-family: monospace; font-size: 14px; padding: 24px;
+               overflow-y: auto; display: none; z-index: 30; }
+  #downloads.visible { display: block; }
+  #downloads h2 { margin: 0 0 12px 0; font-size: 22px; }
+  #downloads .folder { margin-bottom: 16px; padding: 10px 12px; background: #111;
+                       border: 1px solid #333; border-radius: 4px; word-break: break-all; }
+  #downloads .folder b { color: #8cf; }
+  #downloads table { width: 100%; border-collapse: collapse; }
+  #downloads td { padding: 4px 8px; border-bottom: 1px solid #222; vertical-align: top;
+                  word-break: break-all; }
+  #downloads .ok    { color: #6f6; }
+  #downloads .fail  { color: #f66; }
+  #downloads .pend  { color: #ccc; }
+  #downloads .skip  { color: #888; }
+  #downloads .warn  { color: #fc6; }
+  #downloads .audio { color: #8af; }
+  #downloads .hint  { margin-top: 16px; color: #888; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div class="layer" id="layer-a"></div>
+  <div class="layer" id="layer-b"></div>
+</div>
+<div id="progress"><span></span></div>
+
+<audio id="bg-audio" preload="auto"></audio>
+
+<div id="status">init…</div>
+
+<div class="panel" id="panel-init">
+  <h1>DangeeCast</h1>
+  <p>Initialising…</p>
+</div>
+
+<div class="panel" id="panel-unregistered">
+  <h1>This device is not yet assigned</h1>
+  <p>Please contact your administrator with the IDs below.</p>
+  <div class="id">
+    <div>ANDROID_ID: <span id="unreg-aid">…</span></div>
+    <div>MAC: <span id="unreg-mac">…</span></div>
+  </div>
+  <small>The screen will start playing automatically once a playlist is assigned.</small>
+</div>
+
+<div class="panel" id="panel-empty">
+  <h1>No content scheduled</h1>
+  <p id="empty-detail">Today's playlist is empty for this device.</p>
+</div>
+
+<div class="panel" id="panel-error">
+  <h1>Network unreachable</h1>
+  <p id="error-detail">Will retry shortly…</p>
+</div>
+
+<div id="downloads"></div>
+
+<script>
+"use strict";
+
+/* ----------------------------------------------------------------
+ * Configuration. BASE_URL is derived from window.location so the same
+ * player works under any aromen.biz/signage path layout. The APK injects
+ * window.ANDROID_ID and window.MAC_ADDRESS before this script runs (it
+ * does so via WebViewClient.onPageFinished, so it's actually injected
+ * AFTER our first read — we re-read on each tick).
+ * ---------------------------------------------------------------- */
+const SIGNAGE = {
+  // /signage/player/index.html → /signage
+  BASE_URL: (function () {
+    const u = new URL(window.location.href);
+    // Strip /player/<filename> off the end.
+    const path = u.pathname.replace(/\/player\/[^\/]*$/, '');
+    return u.origin + path;
+  })(),
+  // Default poll interval. Overridden by playlist.poll_interval_seconds on
+  // every fetch — see ensurePollInterval() — so the dashboard's per-device
+  // setting wins. 300 s matches the historical APK ping cadence.
+  POLL_MS:        300 * 1000,
+  RETRY_MS:       60 * 1000,         // 60 sec — retry on error
+  MIN_POLL_MS:    30 * 1000,         // floor; matches server-side clamp
+  IDENTITY_WAIT:  3000,              // 3 sec — how long to wait for APK injection before fallback
+  // Fallback "bg vol while video plays" used only when the playlist JSON
+  // doesn't carry a per-day duck_volume (i.e. older server / pre-migration).
+  // The dashboard's Background Music card lets stores override per weekday.
+  DUCK_FACTOR:    0.2,
+  // Path the Service Worker is served from. Its scope = parent dir, so
+  // /signage/sw.js → scope /signage/, covering player + media URLs.
+  SW_PATH: '/signage/sw.js',
+  // Every time-related decision in the player (today's playlist, trigger
+  // matching, midnight rollover) is computed in this fixed offset. India
+  // never observes DST so a numeric offset is exact and avoids depending on
+  // the box's TZ database (some cheap TV boxes ship with broken zoneinfo).
+  TZ_OFFSET_MIN:  330, // Asia/Kolkata = UTC+05:30
+  WEEKDAY_KEYS: ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'],
+};
+
+const els = {
+  stage:        document.getElementById('stage'),
+  layerA:       document.getElementById('layer-a'),
+  layerB:       document.getElementById('layer-b'),
+  progress:     document.querySelector('#progress > span'),
+  status:       document.getElementById('status'),
+  bgAudio:      document.getElementById('bg-audio'),
+  panelInit:    document.getElementById('panel-init'),
+  panelUnreg:   document.getElementById('panel-unregistered'),
+  panelEmpty:   document.getElementById('panel-empty'),
+  panelError:   document.getElementById('panel-error'),
+  unregAid:     document.getElementById('unreg-aid'),
+  unregMac:     document.getElementById('unreg-mac'),
+  errorDetail:  document.getElementById('error-detail'),
+  emptyDetail:  document.getElementById('empty-detail'),
+  downloads:    document.getElementById('downloads'),
+};
+
+/* Track every media load attempt for the DOWN-key diagnostics panel.
+ * Keyed by full URL so a re-attempt updates in place rather than appending. */
+const downloadTracker = {
+  byUrl: new Map(),
+  lastFetchedAt: null,
+  set(url, patch) {
+    const existing = this.byUrl.get(url) || { url, status: 'pending', startedAt: Date.now() };
+    Object.assign(existing, patch, { updatedAt: Date.now() });
+    this.byUrl.set(url, existing);
+    if (els.downloads.classList.contains('visible')) renderDownloads();
+  },
+};
+
+/* ----------------------------------------------------------------
+ * Mutable state.
+ * ---------------------------------------------------------------- */
+const state = {
+  androidId: '',
+  macAddress: '',
+  playlist: null,            // parsed playlist.json or null
+  lastModified: null,        // value of Last-Modified from last successful fetch
+  currentItemTimer: null,    // setTimeout handle for image duration
+  currentVideoEl: null,
+  activeLayer: 'a',          // which layer is currently visible
+  cursor: { weekday: null, index: 0 },
+  midnightTimer: null,
+  hourTimer: null,           // fires at next IST :00 to re-eval hour-filtered items
+  pollTimer: null,
+  currentBgAudioUrl: null,   // URL of the bg-audio track currently loaded into <audio>
+  bgQueueIndex: 0,           // position in today's bg-audio file list
+  bgFilesSnapshot: '',       // joined URLs of last applied bg list — used to detect "playlist changed"
+  triggerTimer: null,        // setInterval handle for the 30s time-trigger check
+  firedTriggers: new Set(),  // "<dateKey>|<triggerId>" pairs already played today
+  inTrigger: false,          // true while a trigger is interrupting normal playback
+  currentPollMs: null,       // last applied poll interval — used to detect dashboard changes
+  // Offline-resilience via Service Worker — sw.js intercepts every
+  // /signage/media/* request and serves cache-first. Cache survives
+  // app restart (Cache Storage is disk-backed). Player tracks two
+  // pieces of state for the diagnostics panel only:
+  swReady: false,            // true once sw.js has registered + activated
+  swCachedUrls: new Set(),   // last-known set of URLs the SW has cached
+  swCachedSizes: new Map(),  // url → bytes (from SW perUrl reply)
+  swStats: null,             // last cache-stats reply { bytes, quota, usage }
+  swRetrying: new Map(),     // url → { state, attempt, totalAttempts, waitMs?, lastError? }
+  cacheReportKey: '',        // last "cached/total" posted to api/cache_status.php — dedups reports
+};
+
+/* ----------------------------------------------------------------
+ * Identity resolution. APK injects globals after page load; if running
+ * in a plain browser we substitute a debug ID so the UI is still usable.
+ * ---------------------------------------------------------------- */
+function resolveIdentity() {
+  state.androidId  = (window.ANDROID_ID || '').toString().trim();
+  state.macAddress = (window.MAC_ADDRESS || window.ETH_MAC || '').toString().trim();
+}
+
+function showPanel(which) {
+  for (const p of [els.panelInit, els.panelUnreg, els.panelEmpty, els.panelError]) {
+    p.classList.remove('visible');
+  }
+  if (which) which.classList.add('visible');
+}
+
+function setStatus(text, level) {
+  els.status.textContent = text;
+  els.status.classList.remove('error', 'warn');
+  if (level === 'error') els.status.classList.add('error');
+  else if (level === 'warn') els.status.classList.add('warn');
+}
+
+/* ----------------------------------------------------------------
+ * Playlist fetch. Uses If-Modified-Since for cheap polling — Apache
+ * answers 304 Not Modified when the file hasn't changed.
+ * ---------------------------------------------------------------- */
+async function fetchPlaylist() {
+  if (!state.androidId) {
+    setStatus('no ANDROID_ID', 'error');
+    return null;
+  }
+  const url = `${SIGNAGE.BASE_URL}/devices/${encodeURIComponent(state.androidId)}/playlist.json`;
+  const headers = {};
+  if (state.lastModified) headers['If-Modified-Since'] = state.lastModified;
+
+  let resp;
+  try {
+    // No 'cache: no-store' here on purpose — we WANT the Service Worker
+    // to cache playlist.json so the box can boot offline and play the
+    // last-known schedule. The SW does network-first for this URL, so
+    // when online we still get fresh content; when offline, the SW
+    // returns the cached playlist transparently and the player can't
+    // tell the difference.
+    resp = await fetch(url, { method: 'GET', headers });
+  } catch (e) {
+    return { ok: false, status: 0, error: e.message || 'fetch error' };
+  }
+
+  if (resp.status === 304) {
+    downloadTracker.lastFetchedAt = Date.now();
+    return { ok: true, notModified: true };
+  }
+  if (resp.status === 404) {
+    return { ok: false, status: 404, unregistered: true };
+  }
+  if (!resp.ok) {
+    return { ok: false, status: resp.status, error: 'HTTP ' + resp.status };
+  }
+  try {
+    const json = await resp.json();
+    state.lastModified = resp.headers.get('Last-Modified') || state.lastModified;
+    downloadTracker.lastFetchedAt = Date.now();
+    return { ok: true, playlist: json };
+  } catch (e) {
+    return { ok: false, status: resp.status, error: 'invalid JSON: ' + e.message };
+  }
+}
+
+/* ----------------------------------------------------------------
+ * Downloads diagnostics panel — toggled by the device DOWN key. The APK
+ * intercepts KEYCODE_DPAD_DOWN and calls window.signageToggleDownloads().
+ * Shows the folder URL at the top + per-item load status, so a tech with
+ * just the remote can see exactly which files are reaching the box.
+ * ---------------------------------------------------------------- */
+function shortFile(url) {
+  try {
+    const u = new URL(url, window.location.href);
+    return u.pathname.split('/').pop() + (u.search || '');
+  } catch (_) {
+    return url;
+  }
+}
+/**
+ * Format an epoch-ms timestamp as HH:MM:SS in Asia/Kolkata (IST), regardless
+ * of the device's local TZ. Matches the dashboard's display so the
+ * "Last playlist fetch" and "Last seen" wall-clocks line up — a box mis-
+ * configured to UTC would otherwise look hours out of sync.
+ */
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const shifted = new Date(ts + SIGNAGE.TZ_OFFSET_MIN * 60 * 1000);
+  return pad2(shifted.getUTCHours()) + ':' +
+         pad2(shifted.getUTCMinutes()) + ':' +
+         pad2(shifted.getUTCSeconds()) + ' IST';
+}
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+/* Pull on-device storage paths from the APK bridge (added in v1.1).
+ * Returns null if running in a plain browser or against an older APK. */
+function getStorageInfo() {
+  if (!window.AndroidBridge || !window.AndroidBridge.getStorageInfo) return null;
+  try {
+    return JSON.parse(window.AndroidBridge.getStorageInfo());
+  } catch (e) {
+    console.warn('[signage] getStorageInfo failed', e);
+    return null;
+  }
+}
+
+function renderDownloads() {
+  const folderUrl = state.androidId
+    ? `${SIGNAGE.BASE_URL}/devices/${encodeURIComponent(state.androidId)}/`
+    : '(unknown — no ANDROID_ID)';
+  const mediaBase = (state.playlist && state.playlist.base_url) || '(unknown — no playlist yet)';
+  const today = currentWeekdayKey();
+  const todays = todaysItems();
+  const sched = (state.playlist && state.playlist.schedule) || {};
+  const storage = getStorageInfo();
+
+  // Format a 0.0–1.0 volume as "L:NN%" with colour: red at 0 (muted), amber
+  // when below 100, green at 100. Defaults to 100% when the playlist omits
+  // the field (matches the player's `?? globalVolume` fallback).
+  const fmtVol = (v, label) => {
+    const pct = Math.round((v == null ? 1.0 : Number(v)) * 100);
+    const cls = pct === 0 ? 'fail' : pct < 100 ? 'warn' : 'ok';
+    return '<span class="' + cls + '">' + label + ':' + pct + '%</span>';
+  };
+
+  // bg/trigs need to be resolved BEFORE the items loop because the per-row
+  // BG: column reads bg.volume. Declaring them later would TDZ-throw inside
+  // the forEach and abort the whole render — that bug used to make DOWN
+  // appear broken on every fresh install.
+  const bg = todaysBgAudio();
+  const trigs = todaysTriggers();
+
+  // Compact "duration" cell. Images: configured display duration from the
+  // playlist (e.g. "10s"). Videos: the natural length we measured at load
+  // time (playlist sends 0 for videos by design). Pending/un-loaded videos
+  // show "(natural)" until the metadata arrives.
+  const fmtDur = (item, tracked) => {
+    if ((item.type || '').toLowerCase() === 'video') {
+      const m = tracked && tracked.naturalDuration;
+      return (m && isFinite(m)) ? Math.round(m) + 's' : '(natural)';
+    }
+    const d = item.duration | 0;
+    return (d > 0 ? d : 10) + 's';
+  };
+
+  // File size — pulled from the SW perUrl map populated by reportStats.
+  // "—" when the URL isn't in the SW cache yet (or SW didn't report it).
+  const fmtSize = (url) => {
+    const n = state.swCachedSizes.get(url);
+    return (typeof n === 'number' && n > 0) ? fmtBytes(n) : '—';
+  };
+
+  // For the panel: show ALL today's items (not just currently playable)
+  // and tag each row with whether it's "live" right now or queued for
+  // a later hour window.
+  const nowHour = istNowParts().hh;
+  const playableCount = todays.filter(function (it) {
+    const s = it.start_hour == null ? 0  : (it.start_hour | 0);
+    const e = it.end_hour   == null ? 24 : (it.end_hour   | 0);
+    return nowHour >= s && nowHour < e;
+  }).length;
+
+  const rows = [];
+  rows.push('<tr><td colspan="7"><b>Today (' + today + ') — ' + todays.length +
+            ' item(s), ' + playableCount + ' playable at ' + pad2(nowHour) + ':00</b></td></tr>');
+  if (todays.length === 0) {
+    rows.push('<tr><td colspan="7" class="skip">(empty playlist for today)</td></tr>');
+  }
+  todays.forEach((it, i) => {
+    const url = it.file && it.file.includes('://') ? it.file : (mediaBase + (it.file || ''));
+    const tracked = downloadTracker.byUrl.get(url);
+    const status = tracked ? tracked.status : 'pending';
+    const cls = status === 'ok' ? 'ok' : status === 'fail' ? 'fail' : 'pend';
+    const detail = tracked && tracked.size ? tracked.size
+                 : tracked && tracked.error ? tracked.error
+                 : '—';
+    const cursor = (i === state.cursor.index) ? '▶ ' : '  ';
+
+    // Show effective bg-music volume per item (auto-ducked when this item
+    // is a video with sound), plus V: for video items. Image items show
+    // BG: only — that's the volume the bg track is actually playing at
+    // while this item is on screen.
+    const bgFull = bg && bg.volume != null ? Number(bg.volume) : 1.0;
+    const bgDuck = bg && bg.duck_volume != null
+      ? Number(bg.duck_volume)
+      : bgFull * SIGNAGE.DUCK_FACTOR;
+    const itemIsVideoWithSound = it.type === 'video'
+      && (it.video_volume == null || Number(it.video_volume) > 0);
+    const effectiveBg = itemIsVideoWithSound ? bgDuck : bgFull;
+    const volParts = [fmtVol(effectiveBg, 'BG')];
+    if (it.type === 'video') volParts.push(fmtVol(it.video_volume, 'V'));
+    const volStr = volParts.join(' ');
+
+    // Cache badge — green "(cached)" when SW has the bytes, amber
+    // "(network)" otherwise. If the SW is mid-retry on this URL,
+    // surface that state so it's clear the box hasn't given up.
+    let cacheBadge;
+    if (state.swCachedUrls.has(url)) {
+      cacheBadge = ' <span class="ok">(cached)</span>';
+    } else {
+      const retry = state.swRetrying.get(url);
+      if (retry) {
+        if (retry.state === 'fetching') {
+          cacheBadge = ' <span class="warn">(fetching ' +
+            retry.attempt + '/' + retry.totalAttempts + ')</span>';
+        } else if (retry.state === 'waiting') {
+          cacheBadge = ' <span class="warn">(retry ' +
+            (retry.attempt) + '/' + retry.totalAttempts + ' in ' +
+            Math.round(retry.waitMs / 1000) + 's)</span>';
+        } else if (retry.state === 'failed') {
+          cacheBadge = ' <span class="fail">(failed: ' +
+            (retry.lastError || 'unknown') + ')</span>';
+        } else {
+          cacheBadge = ' <span class="warn">(network)</span>';
+        }
+      } else {
+        cacheBadge = ' <span class="warn">(network)</span>';
+      }
+    }
+
+    // Hour-window cell. Default 0-24 (all day) shows as "all day" in
+    // muted text; non-default windows show the range; if NOT currently
+    // in-window, mark red so it's obvious why the item isn't playing.
+    const sh = it.start_hour == null ? 0  : (it.start_hour | 0);
+    const eh = it.end_hour   == null ? 24 : (it.end_hour   | 0);
+    let hrCell;
+    if (sh === 0 && eh === 24) {
+      hrCell = '<span class="skip">all day</span>';
+    } else {
+      const inWindow = nowHour >= sh && nowHour < eh;
+      const hrCls = inWindow ? 'ok' : 'warn';
+      hrCell = '<span class="' + hrCls + '">' + sh + '–' + eh + '</span>';
+    }
+
+    rows.push(
+      '<tr>' +
+        '<td class="' + cls + '">' + cursor + '[' + status.toUpperCase() + '] ' + detail + '</td>' +
+        '<td>' + (it.type || '?') + '</td>' +
+        '<td>' + fmtDur(it, tracked) + '</td>' +
+        '<td>' + fmtSize(url) + '</td>' +
+        '<td>' + volStr + '</td>' +
+        '<td>' + hrCell + '</td>' +
+        '<td>' + shortFile(url) + cacheBadge + '</td>' +
+      '</tr>'
+    );
+  });
+
+  // Background-music block — list of tracks that loops continuously today.
+  let bgBlock;
+  const bgTracks = bgTrackList();
+  if (bg && bgTracks.length > 0) {
+    const duckDisplay = bg.duck_volume != null
+      ? fmtVol(bg.duck_volume, 'duck')
+      : '<span class="skip">duck:default</span>';
+    const trackLines = bgTracks.map((t, i) => {
+      const isCurrent = state.currentBgAudioUrl === t.url;
+      const cursor = isCurrent ? '▶' : ' ';
+      const cls    = isCurrent ? 'audio' : 'skip';
+      // Inline per-track vol/duck if set — bracketed to make it visually
+      // distinct from the global per-day numbers in the header.
+      const overrideBits = [];
+      if (t.volume      != null) overrideBits.push(fmtVol(t.volume, 'vol'));
+      if (t.duck_volume != null) overrideBits.push(fmtVol(t.duck_volume, 'duck'));
+      const override = overrideBits.length ? '  [' + overrideBits.join(' ') + ']' : '';
+      let cacheBadge;
+      if (state.swCachedUrls.has(t.url)) {
+        cacheBadge = ' <span class="ok">(cached)</span>';
+      } else {
+        const r = state.swRetrying.get(t.url);
+        if (r && r.state === 'fetching') {
+          cacheBadge = ' <span class="warn">(fetching ' + r.attempt + '/' + r.totalAttempts + ')</span>';
+        } else if (r && r.state === 'waiting') {
+          cacheBadge = ' <span class="warn">(retry ' + r.attempt + '/' + r.totalAttempts +
+                       ' in ' + Math.round(r.waitMs / 1000) + 's)</span>';
+        } else if (r && r.state === 'failed') {
+          cacheBadge = ' <span class="fail">(failed: ' + (r.lastError || 'unknown') + ')</span>';
+        } else {
+          cacheBadge = ' <span class="warn">(network)</span>';
+        }
+      }
+      const sizeBadge = (function () {
+        const n = state.swCachedSizes.get(t.url);
+        return (typeof n === 'number' && n > 0) ? '  <span class="skip">' + fmtBytes(n) + '</span>' : '';
+      })();
+      return '<div><span class="' + cls + '">' + cursor + ' ' + (i + 1) + '. ' +
+             shortFile(t.url) + override + '</span>' + cacheBadge + sizeBadge + '</div>';
+    }).join('');
+    bgBlock =
+      '<div class="folder">' +
+        '<div><b>Background music</b> (' + today + '): ' +
+          bgTracks.length + ' track(s) · default ' +
+          fmtVol(bg.volume, 'vol') + ' · ' + duckDisplay + '</div>' +
+        trackLines +
+      '</div>';
+  } else {
+    bgBlock =
+      '<div class="folder skip">' +
+        '<div><b>Background music</b> (' + today + '): (none)</div>' +
+      '</div>';
+  }
+
+  // Time triggers block — list today's scheduled overrides, marking the ones
+  // that have already fired this calendar day. dateKey must match the IST-
+  // based key checkTriggers writes, otherwise the panel would never show
+  // [fired] on a box whose local TZ differs from IST.
+  const dateKey = istNowParts().dateKey;
+  const trigRows = trigs.map(t => {
+    const fired = state.firedTriggers.has(dateKey + '|' + t.id);
+    const label = fired ? '<span class="skip">[fired]</span>' : '<span class="warn">[pending]</span>';
+    const tUrl = t.file.includes('://') ? t.file : (mediaBase + t.file);
+    let cacheBadge;
+    if (state.swCachedUrls.has(tUrl)) {
+      cacheBadge = ' <span class="ok">(cached)</span>';
+    } else {
+      const r = state.swRetrying.get(tUrl);
+      if (r && r.state === 'fetching') {
+        cacheBadge = ' <span class="warn">(fetching ' + r.attempt + '/' + r.totalAttempts + ')</span>';
+      } else if (r && r.state === 'waiting') {
+        cacheBadge = ' <span class="warn">(retry ' + r.attempt + '/' + r.totalAttempts +
+                     ' in ' + Math.round(r.waitMs / 1000) + 's)</span>';
+      } else if (r && r.state === 'failed') {
+        cacheBadge = ' <span class="fail">(failed: ' + (r.lastError || 'unknown') + ')</span>';
+      } else {
+        cacheBadge = ' <span class="warn">(network)</span>';
+      }
+    }
+    return '<tr>' +
+      '<td>' + label + ' ' + t.time + '</td>' +
+      '<td>' + (t.type || '?') + '</td>' +
+      '<td>' + fmtSize(tUrl) + '</td>' +
+      '<td>' + fmtVol(t.volume, 'V') + '</td>' +
+      '<td>' + shortFile(tUrl) + cacheBadge + '</td>' +
+    '</tr>';
+  });
+  let trigBlock = '';
+  if (trigs.length) {
+    trigBlock =
+      '<h2 style="font-size:18px;margin-top:18px;">⏰ Time triggers (' + today + ')</h2>' +
+      '<table>' + trigRows.join('') + '</table>';
+  } else {
+    trigBlock =
+      '<div class="folder skip" style="margin-top:18px;"><b>Time triggers</b> (' + today + '): (none)</div>';
+  }
+
+  // Per-weekday summary (helps confirm the "copy to all days" worked).
+  const weekSummary = SIGNAGE.WEEKDAY_KEYS
+    .map(w => `${w.slice(0, 3)}:${(sched[w] || []).length}`)
+    .join('  ');
+
+  // Local-storage block — only present when running inside the APK bridge.
+  // Shows the on-device cache directory + free-space numbers so a tech with
+  // adb can find the bytes and confirm there's room for more.
+  let storageBlock = '';
+  if (storage && !storage.error) {
+    const usedPct = storage.total_bytes > 0
+      ? ((storage.total_bytes - storage.free_bytes) / storage.total_bytes * 100).toFixed(0) + '%'
+      : '?';
+    storageBlock =
+      '<div class="folder">' +
+        '<div><b>App data dir</b>:     ' + storage.data_dir + '</div>' +
+        '<div><b>Cache dir</b>:        ' + storage.cache_dir +
+          '   (size: ' + fmtBytes(storage.cache_bytes) + ')</div>' +
+        '<div><b>WebView cache</b>:    ' + storage.webview_cache_dir +
+          '   (size: ' + fmtBytes(storage.webview_cache_bytes) + ')</div>' +
+        '<div><b>Internal storage</b>: ' + fmtBytes(storage.free_bytes) +
+          ' free / ' + fmtBytes(storage.total_bytes) + ' total  (' + usedPct + ' used)</div>' +
+      '</div>';
+  } else if (storage && storage.error) {
+    storageBlock =
+      '<div class="folder"><b>Storage info error</b>: ' + storage.error + '</div>';
+  } else {
+    storageBlock =
+      '<div class="folder skip"><b>Local storage</b>: not available (APK ≥ 1.1 required)</div>';
+  }
+
+  els.downloads.innerHTML =
+    '<h2>Downloads &amp; load status</h2>' +
+    '<div class="folder">' +
+      // Device folder + Media base intentionally moved to the native
+      // diagnostics overlay (long-press OK) — they're identity-style
+      // info, not playback status.
+      '<div><b>ANDROID_ID</b>:    ' + (state.androidId || '(none)') + '</div>' +
+      '<div><b>Last playlist fetch</b>: ' + fmtTime(downloadTracker.lastFetchedAt) +
+        '   (player-JS path; dashboard "Last seen" is updated by the APK ping loop, not this fetch)</div>' +
+      '<div><b>All weekdays</b>:   ' + weekSummary + '</div>' +
+      '<div><b>IST now</b>:        ' + pad2(istNowParts().hh) + ':' + pad2(istNowParts().mm) +
+        '  (' + istNowParts().weekday + ')</div>' +
+      // CSS viewport WebView gives us vs the device pixel screen. If
+      // these differ (or the viewport doesn\'t match the uploaded image
+      // size), object-fit:contain will letterbox the image to fit the
+      // mismatched container — that\'s the source of stray bars on what
+      // SHOULD be a perfectly-sized image.
+      '<div><b>Viewport</b>:     ' + window.innerWidth + ' × ' + window.innerHeight +
+        '   (screen ' + (screen.width || '?') + ' × ' + (screen.height || '?') +
+        ', dpr ' + (window.devicePixelRatio || 1) + ')</div>' +
+      '<div><b>Player JS poll</b>: ' +
+        (state.currentPollMs ? (state.currentPollMs / 1000) + ' s' : '(default)') +
+        '   (rebuilt from playlist.json on each fetch)</div>' +
+      '<div><b>APK ping</b>:       ' + (function () {
+        try {
+          if (window.AndroidBridge && window.AndroidBridge.getPingIntervalSeconds) {
+            return window.AndroidBridge.getPingIntervalSeconds() + ' s';
+          }
+        } catch (_) {}
+        return '(unavailable — APK ≥ 2.0 required)';
+      })() + '   (live value; updates after each ping)</div>' +
+      '<div><b>Pre-cached</b>:    ' + (function () {
+        const allUrls = collectAllMediaUrls(state.playlist);
+        const cached = allUrls.filter(u => state.swCachedUrls.has(u)).length;
+        const cls = (cached === allUrls.length && allUrls.length > 0) ? 'ok'
+                   : cached > 0 ? 'warn'
+                   : 'pend';
+        let summary = '<span class="' + cls + '">' + cached + '/' + allUrls.length + ' files</span>';
+        // Bytes / quota are reported by the SW. Bytes==-1 means SW skipped
+        // the per-entry size walk (cache too big to enumerate cheaply).
+        if (state.swStats) {
+          if (state.swStats.bytes >= 0) {
+            summary += ' · cached ' + (state.swStats.bytes / (1024 * 1024)).toFixed(1) + ' MB';
+          }
+          if (state.swStats.usage != null && state.swStats.quota != null) {
+            const used = (state.swStats.usage / (1024 * 1024)).toFixed(0);
+            const tot  = (state.swStats.quota / (1024 * 1024)).toFixed(0);
+            summary += ' · disk ' + used + ' / ' + tot + ' MB';
+          }
+        }
+        // Three things need to be cached for a full offline reboot to
+        // succeed: the player HTML, the playlist JSON, and the media
+        // files. Show all three so a tech can diagnose at a glance.
+        let swState;
+        if (!state.swReady) {
+          swState = ' <span class="warn">[SW: not ready — direct network only]</span>';
+        } else {
+          const html = state.swStats && state.swStats.hasPlayerHtml;
+          const pl   = state.swStats && state.swStats.hasPlaylist;
+          const media = allUrls.length > 0 && cached === allUrls.length;
+          const fullOffline = html && pl && media;
+          if (fullOffline) {
+            swState = ' <span class="ok">[SW: HTML+playlist+media cached → reboot-safe]</span>';
+          } else {
+            const missing = [];
+            if (!html)  missing.push('html');
+            if (!pl)    missing.push('playlist');
+            if (!media) missing.push('media');
+            swState = ' <span class="warn">[SW: missing ' + missing.join(', ') +
+                      ' — reboot may fail until next online cycle]</span>';
+          }
+        }
+        return summary + swState;
+      })() + '</div>' +
+    '</div>' +
+    bgBlock +
+    storageBlock +
+    '<table>' + rows.join('') + '</table>' +
+    trigBlock +
+    '<div class="hint">Press DOWN again to close.  ' +
+      'Long-press OK for full diagnostics.<br>' +
+      'Image bytes live inside the WebView cache as opaque hashed-name files — ' +
+      'use <code>adb shell ls -la &lt;cache dir&gt;</code> to inspect.</div>';
+}
+
+function showDownloads() {
+  // Pull fresh stats from the SW so the cache numbers reflect any
+  // background activity since the panel was last shown.
+  requestCacheStats();
+  renderDownloads();
+  els.downloads.classList.add('visible');
+}
+function hideDownloads() {
+  els.downloads.classList.remove('visible');
+}
+window.signageToggleDownloads = function () {
+  if (els.downloads.classList.contains('visible')) hideDownloads();
+  else showDownloads();
+};
+
+/* APK bridges the device UP key here. We forget Last-Modified so the
+ * server can't 304-us, then fire a fresh syncOnce. The next ≤10s should
+ * land the new playlist on screen — useful for a tech standing at the
+ * box who just edited the playlist and wants to verify without waiting
+ * for the regular poll interval. */
+window.signageForceFetchPlaylist = function () {
+  state.lastModified = null;
+  setStatus('FORCE FETCH ' + (currentWeekdayKey() || ''), 'warn');
+  // Also poke the SW to check for an updated sw.js. Lets the operator
+  // pick up a freshly-deployed Service Worker without rebooting the box.
+  // Note: even if a new SW installs, it only takes over on the NEXT
+  // page navigation — the current page keeps using the old SW until
+  // a reload. The dashboard's "Force refresh" button does a full reload
+  // (via the APK), so that path swaps the SW immediately; UP-key from
+  // the remote is "soft" and just queues the new SW for the next nav.
+  if (navigator.serviceWorker) {
+    navigator.serviceWorker.getRegistration().then(function (reg) {
+      if (reg) reg.update().catch(function () { /* update is best-effort */ });
+    });
+  }
+  syncOnce().catch(function (e) { console.warn('[signage] force-fetch failed', e); });
+};
+
+/* APK bridges every device key-down through this so we can see what the
+ * remote actually sends. Helpful when "DOWN doesn't work" turns out to mean
+ * "the remote fires KEYCODE_PAGE_DOWN or some vendor-specific keycode". */
+window.signageDebugKey = function (name, code) {
+  setStatus('KEY ' + name + ' (' + code + ')', 'warn');
+};
+
+/* ----------------------------------------------------------------
+ * Playback. Two layers swap to crossfade. Images use a duration
+ * timeout; videos play to natural end and trigger 'ended'.
+ * ---------------------------------------------------------------- */
+
+/**
+ * Returns the wall-clock fields evaluated in Asia/Kolkata, regardless of
+ * the device's local TZ. We shift now-ms by the IST offset and read the
+ * result with UTC getters — that way getUTCHours() returns IST hours, etc.
+ * Cheaper and more reliable than Intl.DateTimeFormat on old WebViews.
+ */
+function istNowParts() {
+  const shifted = new Date(Date.now() + SIGNAGE.TZ_OFFSET_MIN * 60 * 1000);
+  return {
+    yyyy:    shifted.getUTCFullYear(),
+    mon:     shifted.getUTCMonth(),  // 0-11
+    dd:      shifted.getUTCDate(),
+    hh:      shifted.getUTCHours(),
+    mm:      shifted.getUTCMinutes(),
+    weekday: SIGNAGE.WEEKDAY_KEYS[shifted.getUTCDay()],
+    dateKey: shifted.getUTCFullYear() + '-' +
+             (shifted.getUTCMonth() + 1) + '-' +
+             shifted.getUTCDate(),
+  };
+}
+
+function currentWeekdayKey() {
+  return istNowParts().weekday;
+}
+
+function todaysItems() {
+  if (!state.playlist || !state.playlist.schedule) return [];
+  const items = state.playlist.schedule[currentWeekdayKey()];
+  return Array.isArray(items) ? items : [];
+}
+
+/**
+ * Items eligible to play right now, filtered by the per-item start_hour
+ * / end_hour window emitted by the writer. Items without those fields
+ * default to all-day (0..24). Compared against the current IST hour.
+ *
+ * Hour-range semantics: start inclusive, end exclusive — so [9, 12)
+ * fires at 09:00 and stops at 12:00:00 exactly.
+ */
+function playableItems() {
+  const hour = istNowParts().hh;
+  return todaysItems().filter(function (it) {
+    const s = it.start_hour == null ? 0  : (it.start_hour | 0);
+    const e = it.end_hour   == null ? 24 : (it.end_hour   | 0);
+    return hour >= s && hour < e;
+  });
+}
+
+function todaysBgAudio() {
+  if (!state.playlist || !state.playlist.background_audio) return null;
+  return state.playlist.background_audio[currentWeekdayKey()] || null;
+}
+
+function todaysTriggers() {
+  if (!state.playlist || !state.playlist.triggers) return [];
+  const t = state.playlist.triggers[currentWeekdayKey()];
+  return Array.isArray(t) ? t : [];
+}
+
+/* ----------------------------------------------------------------
+ * Service Worker bridge — disk-backed media cache.
+ *
+ * sw.js (served from /signage/sw.js, scope /signage/) intercepts every
+ * /signage/media/* request and serves cache-first. Once a file has been
+ * cached it never re-hits the network — so the screen keeps playing
+ * through a server outage AND the cache survives an app reboot
+ * (Cache Storage is disk-backed by the WebView).
+ *
+ * Communication is one-way postMessage:
+ *   page → SW: { type:'sync-cache', urls:[...] }   on each playlist apply
+ *   page → SW: { type:'cache-stats' }              when the panel opens
+ *   SW   → page: { type:'sync-cache-done', deleted, fetched, failed, cachedUrls }
+ *   SW   → page: { type:'cache-stats-reply', cachedUrls, bytes, quota, usage }
+ *
+ * Eviction: SW deletes anything that's in cache but not in the new
+ * playlist's URL set — implements "delete content not in playlist".
+ * ---------------------------------------------------------------- */
+
+/** Walk the playlist and return every distinct media URL it references. */
+function collectAllMediaUrls(playlist) {
+  if (!playlist) return [];
+  const baseUrl = playlist.base_url || '';
+  const abs = (f) => f && (f.includes('://') ? f : (baseUrl + f));
+  const set = new Set();
+
+  // Items
+  const sched = playlist.schedule || {};
+  for (const day of SIGNAGE.WEEKDAY_KEYS) {
+    for (const it of (sched[day] || [])) {
+      const u = abs(it.file);
+      if (u) set.add(u);
+    }
+  }
+  // Background-music tracks (objects since 005, strings on legacy format)
+  const bg = playlist.background_audio || {};
+  for (const day of SIGNAGE.WEEKDAY_KEYS) {
+    const dayBg = bg[day];
+    if (!dayBg) continue;
+    const files = Array.isArray(dayBg.files) ? dayBg.files
+                 : dayBg.file ? [dayBg.file]
+                 : [];
+    for (const entry of files) {
+      const f = (typeof entry === 'string') ? entry : (entry && entry.file);
+      const u = abs(f);
+      if (u) set.add(u);
+    }
+  }
+  // Time triggers
+  const trigs = playlist.triggers || {};
+  for (const day of SIGNAGE.WEEKDAY_KEYS) {
+    for (const t of (trigs[day] || [])) {
+      const u = abs(t.file);
+      if (u) set.add(u);
+    }
+  }
+  return Array.from(set);
+}
+
+/**
+ * Tell the SW to make its cache match the playlist exactly: fetch
+ * anything new, delete anything no longer referenced. Fire-and-forget
+ * from the page side — SW reports back via 'sync-cache-done' message.
+ */
+function syncMediaCache(playlist) {
+  if (!state.swReady || !navigator.serviceWorker || !navigator.serviceWorker.controller) {
+    // SW not registered yet (first boot pre-activation, or unsupported
+    // browser). Media will fall through to the network on every fetch
+    // until SW takes over on a subsequent page load. No-op here.
+    return;
+  }
+  const urls = collectAllMediaUrls(playlist);
+  navigator.serviceWorker.controller.postMessage({
+    type: 'sync-cache',
+    urls: urls,
+  });
+}
+
+/** Ask the SW for the current cache contents — populates state.swCachedUrls. */
+function requestCacheStats() {
+  if (!state.swReady || !navigator.serviceWorker || !navigator.serviceWorker.controller) return;
+  navigator.serviceWorker.controller.postMessage({ type: 'cache-stats' });
+}
+
+/**
+ * Report media-cache completeness to the server so the dashboard can show
+ * "fully cached" vs "caching 8/12". We compute it here (the SW knows what's
+ * cached; the playlist knows what's wanted) and POST cached/total to
+ * api/cache_status.php.
+ *
+ * Dedup: we only POST when the cached/total pair changes since the last
+ * report. Because the pair stops changing once cached == total, this
+ * naturally satisfies "once fully cached, no more updates" — the last POST
+ * lands the green state and we go quiet until the playlist changes.
+ *
+ * Fire-and-forget: a failed report must never disrupt playback, so all
+ * errors are swallowed. The next file landing (or next playlist apply)
+ * retries implicitly.
+ */
+function reportCacheStatus() {
+  if (!state.androidId || !state.playlist) return;
+  const wanted = collectAllMediaUrls(state.playlist);
+  const total = wanted.length;
+  let cached = 0;
+  for (const u of wanted) {
+    if (state.swCachedUrls.has(u)) cached++;
+  }
+
+  const key = cached + '/' + total;
+  if (key === state.cacheReportKey) return; // unchanged — stay quiet
+  state.cacheReportKey = key;
+
+  const body = 'android_id=' + encodeURIComponent(state.androidId) +
+               '&cached_count=' + cached +
+               '&total_count=' + total;
+  try {
+    fetch(`${SIGNAGE.BASE_URL}/api/cache_status.php`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body,
+      // Don't let the SW cache this POST (it ignores non-GET anyway) and
+      // don't block on it — we genuinely don't care about the response.
+      cache: 'no-store',
+      keepalive: true,
+    }).catch(() => { /* report is best-effort */ });
+  } catch (_) {
+    // Reset the key so a transient failure re-sends on the next trigger.
+    state.cacheReportKey = '';
+  }
+}
+
+/** Bootstrap the SW — registers, then listens for replies. Called once at boot. */
+async function setupServiceWorker() {
+  if (!('serviceWorker' in navigator)) {
+    console.warn('[signage] Service Worker unsupported — offline cache disabled');
+    return;
+  }
+  // Listen for SW → page messages. Updates the panel-visible state.
+  navigator.serviceWorker.addEventListener('message', (e) => {
+    const msg = e.data || {};
+    if (msg.type === 'sync-cache-done') {
+      state.swCachedUrls = new Set(msg.cachedUrls || []);
+      console.log('[signage] sync-cache-done', msg.fetched, 'new,', msg.deleted, 'deleted,', msg.failed, 'failed');
+      reportCacheStatus();
+      // Refresh the panel if it's open right now.
+      if (els.downloads.classList.contains('visible')) renderDownloads();
+    } else if (msg.type === 'cache-stats-reply') {
+      state.swCachedUrls = new Set(msg.cachedUrls || []);
+      state.swCachedSizes = new Map(Object.entries(msg.perUrl || {}));
+      state.swStats = {
+        bytes: msg.bytes, quota: msg.quota, usage: msg.usage,
+        // Tells the panel whether a full offline reboot would survive:
+        // both the player HTML and a playlist need to be cached for that.
+        hasPlayerHtml: msg.hasPlayerHtml, hasPlaylist: msg.hasPlaylist,
+      };
+      reportCacheStatus();
+      if (els.downloads.classList.contains('visible')) renderDownloads();
+    } else if (msg.type === 'cache-progress') {
+      // Per-URL retry state from the SW. Lets the panel render
+      // "retry 2/4 in 15s" inline next to a file that's mid-backoff,
+      // and clear the spinner when it finally lands.
+      if (msg.state === 'cached') {
+        state.swRetrying.delete(msg.url);
+        state.swCachedUrls.add(msg.url);
+        // A file just landed — push incremental progress so the dashboard
+        // ticks up (8/12 → 9/12) while a box is still pulling content.
+        reportCacheStatus();
+      } else {
+        state.swRetrying.set(msg.url, {
+          state: msg.state,
+          attempt: msg.attempt || 0,
+          totalAttempts: msg.totalAttempts || 0,
+          waitMs: msg.waitMs || 0,
+          lastError: msg.lastError || null,
+        });
+      }
+      if (els.downloads.classList.contains('visible')) renderDownloads();
+    }
+  });
+  try {
+    const reg = await navigator.serviceWorker.register(SIGNAGE.SW_PATH);
+    console.log('[signage] SW registered, scope=', reg.scope);
+    // Wait until a controller exists — SW's clients.claim() in the
+    // activate event triggers this on first install. Future page loads
+    // already have a controller from the start.
+    if (!navigator.serviceWorker.controller) {
+      await new Promise((resolve) => {
+        navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true });
+        // Safety timeout — don't block boot forever if the SW never claims.
+        setTimeout(resolve, 5000);
+      });
+    }
+    state.swReady = !!navigator.serviceWorker.controller;
+    if (state.swReady) {
+      // If a playlist was already applied before SW became ready, kick
+      // off the initial cache sync now.
+      if (state.playlist) syncMediaCache(state.playlist);
+      requestCacheStats();
+    }
+  } catch (e) {
+    console.warn('[signage] SW registration failed', e);
+  }
+}
+
+/**
+ * Resolve today's bg track list to an array of {url, volume?, duck_volume?}.
+ * Returns [] if today has no bg music configured.
+ *
+ * Tolerates three input shapes for backwards compat:
+ *   - bg.files = [{file, volume?, duck_volume?}, ...]  (current, since 005)
+ *   - bg.files = [filename, filename, ...]             (004 — strings)
+ *   - bg.file  = "filename"                            (legacy single-track)
+ *
+ * The per-track volume / duck_volume override bg.volume / bg.duck_volume
+ * when present; when null/absent the per-day defaults apply.
+ */
+function bgTrackList() {
+  const bg = todaysBgAudio();
+  if (!bg) return [];
+  const raw = Array.isArray(bg.files) ? bg.files
+            : bg.file ? [bg.file]
+            : [];
+  if (!raw.length) return [];
+  const baseUrl = (state.playlist && state.playlist.base_url) || '';
+  return raw.map(entry => {
+    if (typeof entry === 'string') {
+      const url = entry.includes('://') ? entry : (baseUrl + entry);
+      return { url: url };
+    }
+    const f = (entry && entry.file) || '';
+    const url = f.includes('://') ? f : (baseUrl + f);
+    return {
+      url:         url,
+      volume:      entry.volume,      // may be undefined → inherit
+      duck_volume: entry.duck_volume, // may be undefined → inherit
+    };
+  });
+}
+
+/**
+ * Just the URLs (for snapshot diff + cache-bust comparison). Same order
+ * as bgTrackList so an index from one is valid in the other.
+ */
+function bgFileUrls() {
+  return bgTrackList().map(t => t.url);
+}
+
+/**
+ * Manage the background-music queue. Called from startItem so we can apply
+ * ducking based on what's about to play, and from the trigger end-handler
+ * to restore normal volume.
+ *
+ *   - If today's playlist defines no bg tracks → bg <audio> stops.
+ *   - If the queue list (joined-URL snapshot) changed since last time
+ *     (admin added/removed/reordered tracks, or a new day rolled in) →
+ *     reset to index 0 and start.
+ *   - On `ended` of the current track → bgQueueAdvance() picks next, wraps
+ *     to 0 at end of list. Continuous loop, no gap longer than the
+ *     `ended` event takes to fire (~50 ms).
+ *   - When the current item is a video with sound, drop volume to the
+ *     per-day duck level so the video's own audio is intelligible.
+ *
+ * IMPORTANT: bg-audio must NOT be HTML loop=true — we set loop=false so
+ * the `ended` event fires reliably and we can advance to the next track.
+ * Single-track lists wrap to themselves, which is functionally identical
+ * to looping but uses the same code path as multi-track.
+ */
+/**
+ * Pick the effective volume for the currently-playing bg track, honoring
+ * per-track overrides over per-day defaults, and ducking when a video
+ * with sound is on screen.
+ */
+function effectiveBgVolume(track, bg, forItem) {
+  // Per-track values take precedence; null/undefined → fall back to per-day.
+  const fullVol = clamp01(
+    track && track.volume      != null ? track.volume :
+    bg    && bg.volume         != null ? bg.volume    : 1.0
+  );
+  const duckBase =
+    track && track.duck_volume != null ? track.duck_volume :
+    bg    && bg.duck_volume    != null ? bg.duck_volume    : null;
+  const duckLevel = duckBase == null
+    ? fullVol * SIGNAGE.DUCK_FACTOR
+    : clamp01(duckBase);
+
+  const itemType = forItem ? (forItem.type || '').toLowerCase() : null;
+  const isVideoWithSound = itemType === 'video'
+    && (forItem.video_volume == null || Number(forItem.video_volume) > 0);
+  return isVideoWithSound ? duckLevel : fullVol;
+}
+
+function updateBgAudio(forItem) {
+  // Triggers run their own audio through bgAudio; don't fight that here.
+  if (state.inTrigger) return;
+
+  const bg = todaysBgAudio();
+  const tracks = bgTrackList();
+
+  if (tracks.length === 0) {
+    if (state.currentBgAudioUrl) {
+      els.bgAudio.pause();
+      els.bgAudio.removeAttribute('src');
+      state.currentBgAudioUrl = null;
+      state.bgFilesSnapshot = '';
+      state.bgQueueIndex = 0;
+    }
+    return;
+  }
+
+  // Queue identity = ordered-and-joined URLs. Any change (add, remove,
+  // reorder, file rename via cache-bust) reshuffles us back to index 0
+  // so a newly-uploaded track plays without an app restart.
+  const snapshot = tracks.map(t => t.url).join('|');
+  if (snapshot !== state.bgFilesSnapshot) {
+    state.bgFilesSnapshot = snapshot;
+    state.bgQueueIndex = 0;
+    state.currentBgAudioUrl = null; // force the load below
+  }
+
+  state.bgQueueIndex = state.bgQueueIndex % tracks.length;
+  const track = tracks[state.bgQueueIndex];
+  const targetUrl = track.url;
+
+  if (state.currentBgAudioUrl !== targetUrl) {
+    els.bgAudio.src = targetUrl; // SW intercepts and serves from disk cache
+    els.bgAudio.loop = false; // we manually advance via .onended
+    els.bgAudio.onended = bgQueueAdvance;
+    state.currentBgAudioUrl = targetUrl;
+    els.bgAudio.play().catch(() => {});
+  }
+  els.bgAudio.volume = effectiveBgVolume(track, bg, forItem);
+}
+
+/**
+ * Called when the currently-playing bg track ends. Picks the next track
+ * (wrapping to 0 at the end of the list), re-evaluates volume against
+ * that track's overrides, and starts it.
+ */
+function bgQueueAdvance() {
+  if (state.inTrigger) return;
+  const tracks = bgTrackList();
+  if (!tracks.length) return;
+  state.bgQueueIndex = (state.bgQueueIndex + 1) % tracks.length;
+  const track = tracks[state.bgQueueIndex];
+  els.bgAudio.src = track.url; // SW intercepts and serves from disk cache
+  els.bgAudio.loop = false;
+  els.bgAudio.onended = bgQueueAdvance;
+  state.currentBgAudioUrl = track.url;
+  // Volume needs the current item context to know whether to duck. We
+  // don't have a direct handle on it here, but the next item-boundary
+  // updateBgAudio call will re-evaluate; in the meantime apply the
+  // track's full vol (no duck) as a sensible default.
+  const bg = todaysBgAudio();
+  els.bgAudio.volume = effectiveBgVolume(track, bg, null);
+  els.bgAudio.play().catch(() => {});
+}
+
+/* ----------------------------------------------------------------
+ * Time-of-day triggers. Every 30 s we check the wall-clock against
+ * today's trigger list; if HH:MM matches and we haven't fired this
+ * trigger yet today, we interrupt the current item, play the trigger
+ * media (audio OR video) to its natural end, then resume.
+ * ---------------------------------------------------------------- */
+function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+
+function startTriggerScheduler() {
+  if (state.triggerTimer) clearInterval(state.triggerTimer);
+  // 30 s gives every HH:MM a 1-2 sample window; firedTriggers prevents
+  // double-firing within that window.
+  state.triggerTimer = setInterval(checkTriggers, 30 * 1000);
+  // Run once immediately so a fresh boot at 12:00:30 doesn't miss a 12:00 trigger.
+  checkTriggers();
+}
+
+function checkTriggers() {
+  if (state.inTrigger) return;
+  const list = todaysTriggers();
+  if (!list.length) return;
+
+  // Evaluate everything in IST so a box mis-configured to Pacific Time still
+  // fires Indian-store triggers correctly.
+  const ist = istNowParts();
+  const nowHHMM = pad2(ist.hh) + ':' + pad2(ist.mm);
+
+  for (const t of list) {
+    if (t.time !== nowHHMM) continue;
+    const key = ist.dateKey + '|' + t.id;
+    if (state.firedTriggers.has(key)) continue;
+    state.firedTriggers.add(key);
+    fireTrigger(t);
+    return; // one trigger at a time
+  }
+}
+
+function fireTrigger(trigger) {
+  state.inTrigger = true;
+  console.log('[signage] firing trigger', trigger);
+  setStatus('TRIGGER ' + trigger.time + ' ' + (trigger.type || ''), 'warn');
+
+  clearItemTimers();
+
+  const baseUrl = (state.playlist && state.playlist.base_url) || '';
+  const fileUrl = trigger.file.includes('://') ? trigger.file : (baseUrl + trigger.file);
+  const triggerVol = clamp01(trigger.volume == null ? 1.0 : trigger.volume);
+  const triggerType = (trigger.type || '').toLowerCase();
+
+  // Pause bg music so it doesn't bleed into the trigger.
+  els.bgAudio.pause();
+
+  // Trigger media goes through the SW like everything else — cached on
+  // first fire, instantly available on subsequent fires (and offline).
+  const triggerPlaybackUrl = fileUrl;
+
+  if (triggerType === 'video') {
+    const target = nextLayer();
+    target.innerHTML = '';
+    const v = document.createElement('video');
+    v.src = triggerPlaybackUrl;
+    v.autoplay = true;
+    v.muted = triggerVol === 0;
+    v.volume = triggerVol;
+    v.playsInline = true;
+    v.controls = false;
+    v.onended = () => endTrigger();
+    v.onerror = () => endTrigger();
+    target.appendChild(v);
+    state.currentVideoEl = v;
+    swapLayers();
+    setProgressFromVideo(v);
+  } else {
+    // Audio trigger — reuse the bgAudio element (we'll re-init bg music in endTrigger).
+    els.bgAudio.src = triggerPlaybackUrl;
+    els.bgAudio.loop = false;
+    els.bgAudio.volume = triggerVol;
+    els.bgAudio.onended = () => endTrigger();
+    els.bgAudio.play().catch(() => endTrigger());
+  }
+}
+
+function endTrigger() {
+  state.inTrigger = false;
+  // Force updateBgAudio to re-establish the bg queue — the trigger may have
+  // commandeered the <audio> element with a different src/onended handler.
+  els.bgAudio.pause();
+  els.bgAudio.onended = null;
+  state.currentBgAudioUrl = null;
+  // Clear any video element we used for the trigger.
+  if (state.currentVideoEl) {
+    state.currentVideoEl.onended = null;
+    state.currentVideoEl = null;
+  }
+  // Resume normal flow at next item — startItem → updateBgAudio re-arms
+  // the queue at its current index.
+  advance();
+}
+
+function clearItemTimers() {
+  if (state.currentItemTimer) {
+    clearTimeout(state.currentItemTimer);
+    state.currentItemTimer = null;
+  }
+  if (state.currentVideoEl) {
+    state.currentVideoEl.onended = null;
+    state.currentVideoEl.pause();
+    state.currentVideoEl = null;
+  }
+}
+
+function nextLayer() {
+  return state.activeLayer === 'a' ? els.layerB : els.layerA;
+}
+
+function swapLayers() {
+  if (state.activeLayer === 'a') {
+    els.layerA.classList.remove('visible');
+    els.layerB.classList.add('visible');
+    state.activeLayer = 'b';
+  } else {
+    els.layerB.classList.remove('visible');
+    els.layerA.classList.add('visible');
+    state.activeLayer = 'a';
+  }
+}
+
+function startItem(item, baseUrl) {
+  clearItemTimers();
+  const target = nextLayer();
+  target.innerHTML = '';
+
+  const fileUrl = item.file.includes('://') ? item.file : (baseUrl + item.file);
+  const itemType = (item.type || '').toLowerCase();
+  const globalVolume = (state.playlist && typeof state.playlist.global_volume === 'number')
+    ? state.playlist.global_volume : 1.0;
+
+  // Bg music is global per-day, not per-item. updateBgAudio handles the
+  // ducking decision based on this item's type / video_volume.
+  updateBgAudio(item);
+
+  downloadTracker.set(fileUrl, { type: itemType, status: 'pending', size: null });
+
+  // Use the network URL directly — Service Worker intercepts transparently
+  // and serves from disk cache when offline. No wrapping needed.
+  const playbackUrl = fileUrl;
+
+  if (itemType === 'video') {
+    const v = document.createElement('video');
+    v.src = playbackUrl;
+    v.autoplay = true;
+    v.muted = item.video_volume === 0; // muted=true bypasses autoplay restrictions
+    v.volume = clamp01(item.video_volume ?? globalVolume);
+    v.playsInline = true;
+    v.controls = false;
+    v.onloadeddata = () => downloadTracker.set(fileUrl, {
+      status: 'ok',
+      size: `${v.videoWidth}x${v.videoHeight}`,
+      // Capture the natural length so the DOWN-key panel can show e.g. "12s"
+      // for videos. Playlist JSON carries duration:0 for videos by design
+      // (player plays to onended), so we have to measure it here.
+      naturalDuration: v.duration,
+    });
+    v.onended = () => advance();
+    v.onerror = () => {
+      downloadTracker.set(fileUrl, { status: 'fail', error: 'video error' });
+      advance();
+    };
+    target.appendChild(v);
+    state.currentVideoEl = v;
+    swapLayers();
+    setProgressFromVideo(v);
+  } else {
+    const img = document.createElement('img');
+    img.alt = '';
+    // Hook load/error BEFORE assigning src so we never miss the event for cached
+    // images. naturalWidth/Height of 0 after onload means the decoder rejected
+    // it (oversized JPEG on a weak WebView) — surface that to the status overlay
+    // and skip the item instead of dwelling on a black screen for $duration.
+    img.onload = () => {
+      const w = img.naturalWidth | 0, h = img.naturalHeight | 0;
+      if (w === 0 || h === 0) {
+        downloadTracker.set(fileUrl, { status: 'fail', error: 'decoded 0x0' });
+        setStatus(`img DECODE FAIL ${fileUrl.split('/').pop()}`, 'error');
+        console.warn('[signage] image decoded to 0x0 — too big for WebView?', fileUrl);
+        advance();
+      } else {
+        downloadTracker.set(fileUrl, { status: 'ok', size: `${w}x${h}` });
+        setStatus('');
+      }
+    };
+    img.onerror = (e) => {
+      downloadTracker.set(fileUrl, { status: 'fail', error: 'load error' });
+      setStatus(`img LOAD FAIL ${fileUrl.split('/').pop()}`, 'error');
+      console.warn('[signage] image failed to load', fileUrl, e);
+      advance();
+    };
+    img.src = playbackUrl;
+    target.appendChild(img);
+    swapLayers();
+    const durationMs = Math.max(1000, ((item.duration ?? 10) | 0) * 1000);
+    setProgressForDuration(durationMs);
+    state.currentItemTimer = setTimeout(() => advance(), durationMs);
+  }
+
+  setStatus('');
+}
+
+function advance() {
+  // playableItems() filters by current IST hour. Empty result means
+  // nothing's scheduled for this hour — show panel-empty until the
+  // hour boundary fires and items reappear.
+  const items = playableItems();
+  if (items.length === 0) {
+    const allCount = todaysItems().length;
+    if (allCount > 0) {
+      els.emptyDetail.textContent = `No items scheduled for the current hour (${pad2(istNowParts().hh)}:00). Items will appear when their hour-range comes up.`;
+    } else {
+      els.emptyDetail.textContent = "Today's playlist is empty for this device.";
+    }
+    showPanel(els.panelEmpty);
+    return;
+  }
+  state.cursor.index = (state.cursor.index + 1) % items.length;
+  startItem(items[state.cursor.index], state.playlist.base_url || '');
+}
+
+function clamp01(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 1.0;
+  return Math.max(0, Math.min(1, n));
+}
+
+/* Progress bar — for images we tween via setInterval; for videos we read
+ * currentTime / duration. */
+let progressTicker = null;
+function setProgressForDuration(ms) {
+  clearProgress();
+  const start = performance.now();
+  els.progress.style.width = '0%';
+  progressTicker = setInterval(() => {
+    const pct = Math.min(100, ((performance.now() - start) / ms) * 100);
+    els.progress.style.width = pct + '%';
+    if (pct >= 100) clearProgress();
+  }, 100);
+}
+function setProgressFromVideo(v) {
+  clearProgress();
+  els.progress.style.width = '0%';
+  progressTicker = setInterval(() => {
+    if (!v.duration || !isFinite(v.duration)) return;
+    els.progress.style.width = ((v.currentTime / v.duration) * 100) + '%';
+  }, 200);
+}
+function clearProgress() {
+  if (progressTicker) { clearInterval(progressTicker); progressTicker = null; }
+}
+
+/* ----------------------------------------------------------------
+ * Sync loop: poll playlist on schedule, react to changes.
+ * ---------------------------------------------------------------- */
+async function syncOnce() {
+  resolveIdentity();
+  if (!state.androidId) {
+    showPanel(els.panelInit);
+    setStatus('waiting for ANDROID_ID', 'warn');
+    return;
+  }
+
+  const r = await fetchPlaylist();
+  if (!r.ok) {
+    if (r.unregistered) {
+      // Two reasons we can see a 404 here:
+      //   (a) Truly unassigned device — ANDROID_ID isn't in /devices/. We
+      //       must show panel-unregistered so the operator knows to assign.
+      //   (b) Server-side path vanished (e.g. admin renamed /signage/ →
+      //       /signage_/). The device is still assigned upstream; the URL
+      //       just doesn't resolve right now. Treat as a transient offline
+      //       and leave the cached loop running — we have no business
+      //       wiping the screen because the operator broke a path.
+      // Heuristic: if state.playlist already exists, we KNOW the device
+      // was assigned (we successfully fetched its playlist before), so
+      // a 404 now is case (b). Otherwise assume (a).
+      if (!state.playlist) {
+        els.unregAid.textContent = state.androidId || '(unknown)';
+        els.unregMac.textContent = state.macAddress || '(unknown)';
+        showPanel(els.panelUnreg);
+        setStatus('unassigned device', 'warn');
+      } else {
+        setStatus('offline: HTTP 404 (server path moved?)', 'error');
+      }
+      return;
+    }
+    setStatus('offline: ' + (r.error || ('HTTP ' + r.status)), 'error');
+    if (!state.playlist) {
+      els.errorDetail.textContent = `Will retry every ${SIGNAGE.RETRY_MS / 1000} seconds.`;
+      showPanel(els.panelError);
+    }
+    return;
+  }
+
+  if (r.notModified) {
+    setStatus('');
+    if (!state.playlist) showPanel(null); // reset panels if we recovered
+    return;
+  }
+
+  // Got a fresh playlist. Apply it without blowing away the current playback
+  // mid-item — we restart at index 0 of the new today's array.
+  state.playlist = r.playlist;
+  state.cursor.weekday = currentWeekdayKey();
+  state.cursor.index = -1; // advance() bumps to 0
+  ensurePollInterval(); // dashboard may have changed the cadence
+  // Tell the SW to make its disk cache match the new playlist exactly:
+  // fetch missing URLs, delete anything no longer referenced. Survives
+  // app restart — the box can boot offline and still play yesterday's
+  // schedule from cache.
+  syncMediaCache(state.playlist);
+  showPanel(null);
+  setStatus(`new playlist applied`);
+  advance();
+}
+
+/**
+ * If playlist.poll_interval_seconds differs from the rate we're polling
+ * at right now, tear down the existing interval and rebuild. Called after
+ * every successful playlist fetch (200 OK with content), so a dashboard
+ * change to the cadence takes effect within ≤1 cycle.
+ */
+function ensurePollInterval() {
+  const fromPlaylist = state.playlist && state.playlist.poll_interval_seconds;
+  const desiredMs = (fromPlaylist && fromPlaylist > 0)
+    ? Math.max(SIGNAGE.MIN_POLL_MS, fromPlaylist * 1000)
+    : SIGNAGE.POLL_MS;
+  if (state.currentPollMs === desiredMs) return;
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  state.pollTimer = setInterval(syncOnce, desiredMs);
+  state.currentPollMs = desiredMs;
+  console.log('[signage] poll interval set to', desiredMs / 1000, 's');
+}
+
+/**
+ * Hour-boundary scheduler — fires at the next IST :00 (+5 s slack) and
+ * forces an advance() so playback re-evaluates against the new hour.
+ *
+ * Without this, a panel-empty box (because no items match the current
+ * hour) would sit forever; or a still-playing-image item with a 20 s
+ * duration would carry over past the hour boundary and only swap on
+ * its own timer. The forced advance picks up the new hour's items
+ * immediately at :00:05.
+ */
+function scheduleHourBoundary() {
+  if (state.hourTimer) clearTimeout(state.hourTimer);
+  const offsetMs = SIGNAGE.TZ_OFFSET_MIN * 60 * 1000;
+  const ist = istNowParts();
+  // Next IST :00:05 — either the top of this hour + 1 (most common)
+  // or, if we're literally at HH:00 already, the next hour.
+  const nextHourUtcMs = Date.UTC(ist.yyyy, ist.mon, ist.dd, ist.hh + 1, 0, 5) - offsetMs;
+  const msUntil = Math.max(5000, nextHourUtcMs - Date.now());
+  state.hourTimer = setTimeout(() => {
+    // Reset cursor so the new hour's list starts at index 0 (not at
+    // whatever modulo position the old cursor landed on).
+    state.cursor.index = -1;
+    advance();
+    scheduleHourBoundary();
+  }, msUntil);
+}
+
+function scheduleMidnightRollover() {
+  if (state.midnightTimer) clearTimeout(state.midnightTimer);
+  // Compute "next IST midnight + 5 s" expressed as wall-clock UTC ms, then
+  // turn that into "ms from now" using the box's actual clock. Box TZ is
+  // irrelevant — the rollover always lands on IST 00:00:05.
+  const offsetMs = SIGNAGE.TZ_OFFSET_MIN * 60 * 1000;
+  const ist = istNowParts();
+  const nextIstMidnightUtcMs = Date.UTC(ist.yyyy, ist.mon, ist.dd + 1, 0, 0, 5) - offsetMs;
+  const msUntil = Math.max(1000, nextIstMidnightUtcMs - Date.now());
+  state.midnightTimer = setTimeout(() => {
+    state.cursor.weekday = currentWeekdayKey();
+    state.cursor.index = -1;
+    // New IST day → today's triggers are all "not yet fired" again, and the
+    // bg-music URL may have changed (per-day setting). Force a fresh resolve.
+    state.firedTriggers.clear();
+    state.currentBgAudioUrl = null;
+    advance();
+    scheduleMidnightRollover();
+  }, msUntil);
+}
+
+/* ----------------------------------------------------------------
+ * Force refresh — APK can dispatch this event after ping.php returns
+ * force_refresh:true. We forget the Last-Modified value so the next
+ * fetch always returns 200 with the new JSON.
+ * ---------------------------------------------------------------- */
+window.addEventListener('signage:force-refresh', () => {
+  state.lastModified = null;
+  syncOnce();
+});
+
+/* ----------------------------------------------------------------
+ * Boot. Identity may not be available on the very first script tick
+ * (APK injects it via evaluateJavascript after onPageFinished), so we
+ * give it a brief grace window before falling back to the unregistered
+ * panel.
+ * ---------------------------------------------------------------- */
+async function boot() {
+  showPanel(els.panelInit);
+  resolveIdentity();
+  const t0 = Date.now();
+  while (!state.androidId && Date.now() - t0 < SIGNAGE.IDENTITY_WAIT) {
+    await new Promise(r => setTimeout(r, 200));
+    resolveIdentity();
+  }
+  // Register SW first so it can intercept the very first media fetches.
+  // Awaited because subsequent syncOnce → syncMediaCache will no-op
+  // until the SW controller exists.
+  await setupServiceWorker();
+  await syncOnce();
+  scheduleMidnightRollover();
+  scheduleHourBoundary();
+  startTriggerScheduler();
+  // pollTimer is set by ensurePollInterval() inside syncOnce on first
+  // successful fetch. Belt-and-suspenders default in case the very first
+  // sync 304's or fails — keeps us polling at the conservative default
+  // until a 200 carries the per-device interval.
+  if (!state.pollTimer) {
+    state.pollTimer = setInterval(syncOnce, SIGNAGE.POLL_MS);
+    state.currentPollMs = SIGNAGE.POLL_MS;
+  }
+}
+boot();
+</script>
+</body>
+</html>

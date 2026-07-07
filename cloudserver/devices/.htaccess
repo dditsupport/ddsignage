@@ -1,0 +1,14 @@
+# /devices/ holds per-device playlist.json files only. Disable directory
+# listing so the device list isn't crawlable, but allow JSON GETs.
+Options -Indexes
+
+<FilesMatch "\.json$">
+    Header set Cache-Control "no-cache, must-revalidate"
+    Header set Access-Control-Allow-Origin "*"
+</FilesMatch>
+
+# Block anything that isn't a .json file (defense-in-depth — there shouldn't
+# be anything else here, but a stray upload shouldn't be servable).
+<FilesMatch "^(?!.*\.json$).*$">
+    Require all denied
+</FilesMatch>

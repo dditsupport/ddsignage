@@ -1,0 +1,2 @@
+# /logs/ is for server-side use only. Block all public access.
+Require all denied
