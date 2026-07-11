@@ -10,7 +10,7 @@ package biz.aromen.signage
  */
 object SignageConfig {
 
-    const val playerUrl: String = "https://aromen.biz/signage/player/index.html"
+    const val playerUrl: String = "https://yourdomain/signage/player/index.html"
     const val enableLogging: Boolean = true
     const val forceFullscreen: Boolean = true
 }
