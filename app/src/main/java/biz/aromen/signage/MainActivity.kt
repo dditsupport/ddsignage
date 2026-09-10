@@ -5,6 +5,7 @@ import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import android.media.AudioManager
 import android.net.http.SslError
 import android.os.Build
@@ -47,6 +48,13 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     @Volatile private var diagnosticsStarted = false
     private val showDiagnosticsRunnable = Runnable { showDiagnosticsOverlay() }
+
+    /** Transparent stand-in for WebView's built-in video poster — see
+     *  getDefaultVideoPoster() in configureWebView. Created once; WebView
+     *  only reads it, so sharing a single immutable bitmap is safe. */
+    private val blankVideoPoster: Bitmap by lazy {
+        Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888).apply { eraseColor(0) }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -357,6 +365,16 @@ class MainActivity : AppCompatActivity() {
         wv.addJavascriptInterface(AndroidBridge(applicationContext), "AndroidBridge")
         wv.webViewClient = SignageWebViewClient()
         wv.webChromeClient = object : WebChromeClient() {
+            // WebView paints its own built-in poster — a large grey play-button
+            // circle — over any <video> that has no poster and hasn't decoded a
+            // frame yet. On a signage wall that shows up as a play icon flashing
+            // on screen before every clip. Returning a 1x1 transparent bitmap
+            // leaves the layer black instead. The player also sets a transparent
+            // poster on every <video> it creates; this covers the same ground
+            // from the app side so a stale cached player build can't reintroduce
+            // the icon.
+            override fun getDefaultVideoPoster(): Bitmap? = blankVideoPoster
+
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
                 Log.i(
                     TAG,

@@ -208,6 +208,7 @@ const state = {
   swStats: null,             // last cache-stats reply { bytes, quota, usage }
   swRetrying: new Map(),     // url → { state, attempt, totalAttempts, waitMs?, lastError? }
   cacheReportKey: '',        // last "cached/total" posted to api/cache_status.php — dedups reports
+  mediaEpoch: 0,             // bumped whenever we abandon the current item — see clearItemTimers()
 };
 
 /* ----------------------------------------------------------------
@@ -1213,12 +1214,12 @@ function fireTrigger(trigger) {
     v.volume = triggerVol;
     v.playsInline = true;
     v.controls = false;
+    v.poster = BLANK_POSTER;
     v.onended = () => endTrigger();
     v.onerror = () => endTrigger();
     target.appendChild(v);
     state.currentVideoEl = v;
-    swapLayers();
-    setProgressFromVideo(v);
+    revealVideoWhenReady(v);
   } else {
     // Audio trigger — reuse the bgAudio element (we'll re-init bg music in endTrigger).
     els.bgAudio.src = triggerPlaybackUrl;
@@ -1247,6 +1248,11 @@ function endTrigger() {
 }
 
 function clearItemTimers() {
+  // Any deferred work belonging to the item we're abandoning (notably the
+  // "reveal the video once it has a frame" swap below) checks this epoch
+  // before touching the stage, so a late callback can't swap in a layer
+  // that has already been recycled for the next item.
+  state.mediaEpoch++;
   if (state.currentItemTimer) {
     clearTimeout(state.currentItemTimer);
     state.currentItemTimer = null;
@@ -1255,6 +1261,48 @@ function clearItemTimers() {
     state.currentVideoEl.onended = null;
     state.currentVideoEl.pause();
     state.currentVideoEl = null;
+  }
+}
+
+/* 1x1 fully transparent GIF. Android WebView draws its own built-in poster
+ * — a big grey play-button circle — for any <video> that has no poster and
+ * hasn't decoded a frame yet. Handing it a transparent poster suppresses
+ * that placeholder so the layer just stays black until the video paints.
+ * MainActivity also overrides getDefaultVideoPoster() as a second line of
+ * defence, but this fix ships with the player, not with an APK rollout. */
+const BLANK_POSTER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+
+/* How long we'll hold the previous item on screen waiting for a video's
+ * first frame before giving up and swapping anyway. Long enough for a
+ * cold decode on a slow TV box, short enough not to look like a freeze. */
+const VIDEO_REVEAL_TIMEOUT_MS = 3000;
+
+/* Swap the freshly-built layer in only once the <video> has an actual frame
+ * to show. Swapping the moment the element is appended exposes a blank/poster
+ * frame while the decoder spins up; waiting for 'loadeddata' means the very
+ * first thing on screen is video. Falls back to a timed swap so a video that
+ * never reports readiness can't strand us on the previous item. */
+function revealVideoWhenReady(v) {
+  const epoch = state.mediaEpoch;
+  let done = false;
+  const reveal = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    v.removeEventListener('loadeddata', reveal);
+    v.removeEventListener('playing', reveal);
+    // Item was abandoned while we waited — its layer belongs to someone else now.
+    if (state.mediaEpoch !== epoch) return;
+    swapLayers();
+    setProgressFromVideo(v);
+  };
+  const timer = setTimeout(reveal, VIDEO_REVEAL_TIMEOUT_MS);
+  // readyState >= HAVE_CURRENT_DATA means a frame is already decoded (cached
+  // video), in which case 'loadeddata' has fired before we got here.
+  if (v.readyState >= 2) reveal();
+  else {
+    v.addEventListener('loadeddata', reveal);
+    v.addEventListener('playing', reveal);
   }
 }
 
@@ -1302,6 +1350,7 @@ function startItem(item, baseUrl) {
     v.volume = clamp01(item.video_volume ?? globalVolume);
     v.playsInline = true;
     v.controls = false;
+    v.poster = BLANK_POSTER;
     v.onloadeddata = () => downloadTracker.set(fileUrl, {
       status: 'ok',
       size: `${v.videoWidth}x${v.videoHeight}`,
@@ -1317,8 +1366,7 @@ function startItem(item, baseUrl) {
     };
     target.appendChild(v);
     state.currentVideoEl = v;
-    swapLayers();
-    setProgressFromVideo(v);
+    revealVideoWhenReady(v);
   } else {
     const img = document.createElement('img');
     img.alt = '';
