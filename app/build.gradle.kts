@@ -41,8 +41,8 @@ android {
         applicationId = "biz.aromen.signage"
         minSdk = 23
         targetSdk = 36
-        versionCode = 17
-        versionName = "2.4.1"
+        versionCode = 18
+        versionName = "2.4.2"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
